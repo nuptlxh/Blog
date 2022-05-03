@@ -1,9 +1,9 @@
 ---
 title: ClickHouse线程池
-date: 2022-04-17 16:10:28
+date: 2022-04-20 16:10:28
 tags: [ClickHouse]
 categories:
-     - [大数据]
+     - OLAP
 comments: true
 ---
 ### 线程池的类关系
