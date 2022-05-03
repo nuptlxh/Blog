@@ -56,7 +56,7 @@ PIPELINE结果如下
 
 ```
 上述结果的 x 表示有几个这个类型的processor，比如有6个MergeTreeThread来拉取数据，而
-x->y中，x表示有几个inPort，y表示有几个outPort。形象的表达如下图。相同颜色的表示同一类型的processor。
+x->y中，x表示有几个inPort，y表示有几个outPort。其中括号内的内容表示对应的queryPlanStep。笔者对ClickHouse中这一查询进行debug，其中具体pipeline表达如下图。相同颜色的表示同一类型的processor。
 ![](https://lxhblog.oss-cn-beijing.aliyuncs.com/bigdata/pipeline.png)
 
 构建pipeline的代码调用栈如下图。
