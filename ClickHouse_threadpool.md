@@ -6,6 +6,10 @@ categories:
      - OLAP
 comments: true
 ---
+### 线程池的一般原理
+线程池（Thread Pool），简单理解就是系统一方面为了减少创建销毁线程的开销，另一方面避免
+系统中线程数量膨胀导致的调度开销，而维护的一系列线程集合。其工作原理非常简单，线程池中维护一系列的worker线程和一个任务队列，这些worker线程不断的从任务队列里来取出任务并执行。客户端只需要通过接口向线程池中提交任务即可，线程池负责这些任务的调度与执行。接下来主要从ClickHouse中线程池的类关系，启动过程，worker工作线程，job提交几方面来讲述。
+
 ### 线程池的类关系
 ClickHouse中的线程池实现定义在ThreadPool.文件中。类似于boost::threadpool。
 几个主要类关系为下
@@ -55,7 +59,7 @@ ReturnType ThreadPoolImpl<Thread>::scheduleImpl(Job job, int priority, std::opti
 
             try
             {
-                //这一行代码创建线程了新的worker线程。
+                //这一行代码创建线程了新的worker线程。Thread是模板类型std:thread
                 threads.front() = Thread([this, it = threads.begin()] { worker(it); });
             }
             catch (...)
@@ -65,7 +69,7 @@ ReturnType ThreadPoolImpl<Thread>::scheduleImpl(Job job, int priority, std::opti
             }
         }
 
-        jobs.emplace(std::move(job), priority);
+        jobs.emplace(std::move(job), priority); //task入队列
         ++scheduled_jobs;
         new_job_or_shutdown.notify_one();
     }
@@ -74,7 +78,7 @@ ReturnType ThreadPoolImpl<Thread>::scheduleImpl(Job job, int priority, std::opti
 }
 ```
 #### worker线程
-每个worker线程,如下,省略部分非核心代码,以及异常判断。核心思想就是从tasks队列里
+每个worker线程,如下,省略部分非核心代码,以及异常判断。核心思想就是从tasks队列里按序
 取出jobWithPriority对象，然后转换成job对象，可以理解为一个函数，然后执行这个函数，不段的重复这个过程。
 ```
 void ThreadPoolImpl<Thread>::worker(typename std::list<Thread>::iterator thread_it)
@@ -156,7 +160,7 @@ void ThreadPoolImpl<Thread>::worker(typename std::list<Thread>::iterator thread_
 }
 ```
 #### job的提交
-ClickHouse的线程实现为类ThreadFromGlobalPool，使用方法类似于std::thread,只不过添加了ThreadStatus for ClickHouse。ThreadFromGlobalPool的核心方法为他的构造函数。在创建ThreadFromGlobalPool对象时，同时也向GlobalThreadPool提交了job(方法scheduleorThrow中会调用上面讲到的scheduleImpl方法，从而提交将任务提交到线程池中去)
+ClickHouse的线程实现为类ThreadFromGlobalPool，使用方法类似于std::thread,只不过添加了ThreadStatus for ClickHouse。ThreadFromGlobalPool的核心方法为他的构造函数。在创建ThreadFromGlobalPool对象时，同时也向GlobalThreadPool提交了job(方法scheduleorThrow中会调用上面讲到的scheduleImpl方法，从而将任务提交到线程池中去)
 ```
 template <typename Function, typename... Args>
     explicit ThreadFromGlobalPool(Function && func, Args &&... args)
