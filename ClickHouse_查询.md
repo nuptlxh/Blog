@@ -1,4 +1,11 @@
-### ClickHouse查询
+---
+title: ClickHouse的ReadPath
+date: 2022-05-10 16:10:28
+tags: [ClickHouse]
+categories:
+     - [大数据]
+comments: true
+---
 ### MergeTree存储引擎
 #### 数据存储
 以表hits_v1 为例，它的数据目录如下所示。
