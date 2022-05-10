@@ -1,46 +1,51 @@
 ### ClickHouse查询
 ### MergeTree存储引擎
 #### 数据存储
-以表visits_v1 为例，它的数据目录如下所示。
+以表hits_v1 为例，它的数据目录如下所示。
 ```
-./visits_v1
-├── 201403_1_6_1
+.
+├── 197506_32_85_11
+│   ├── checksums.txt
+│   ├── columns.txt
+│   ├── count.txt
+│   ├── data.bin
+│   ├── data.mrk3
+│   ├── default_compression_codec.txt
+│   ├── minmax_EventDate.idx
+│   ├── partition.dat
+│   └── primary.idx
+├── 201403_1_31_2
 │   ├── AdvEngineID.bin
 │   ├── AdvEngineID.mrk2
 │   ├── Age.bin
 │   ├── Age.mrk2
-│   ├── Attendance.bin
-│   ├── Attendance.mrk2
 │   ├── BrowserCountry.bin
 │   ├── BrowserCountry.mrk2
 │   ├── BrowserLanguage.bin
 │   ├── BrowserLanguage.mrk2
 ... ...
-├── 201403_7_10_1
-│   ├── AdvEngineID.bin
-│   ├── AdvEngineID.mrk2
-│   ├── Age.bin
-│   ├── Age.mrk2
-│   ├── Attendance.bin
-│   ├── Attendance.mrk2
-│   ├── BrowserCountry.bin
-│   ├── BrowserCountry.mrk2
-│   ├── BrowserLanguage.bin
-│   ├── BrowserLanguage.mrk2
+│   ├── minmax_EventDate.idx
 ... ...
-│   ├── YCLID.bin
-│   └── YCLID.mrk2
+├── 202204_109_109_0
+│   ├── checksums.txt
+│   ├── columns.txt
+│   ├── count.txt
+│   ├── data.bin
+│   ├── data.mrk3
+│   ├── default_compression_codec.txt
+│   ├── minmax_EventDate.idx
+│   ├── partition.dat
+│   └── primary.idx
 ├── detached
-└──format_version.txt
-
-3 directories, 784 files
+├── format_version.txt
+└── temp.text
 ```
+可以看到，上面显示了3个Datapart,DataPart197506_32_85_11和202204_109_109_0的数据组织方式是Compact,而201403_1_31_2的数拒组织方式是Wide。两种方式主要区别在于Compact方式的所有列数据存放在一个Data.bin文件中,而Wide方式中则是每一个列有一个columnsName.bin文件对应。
 visits_v1: ClickHouse的每个表都会在其设置的数据目录下有个目录文件对应。
 
-201403_1_6_1：分区目录，visits_v1的分区键为StartDate字段的年月(PARTITION BY toYYYYMM(StartDate))
-201403_7_10_1:分区目录，这个分区下的所有datapart的toYYYYMM(StartDate)都是201403
+197506_32_85_11,201403_1_6_1,202204_109_109_0：分区目录，hits_v1的分区键为StartDate字段的年月(PARTITION BY toYYYYMM(StartDate))
 
-分区目录的格式为partionKey_minBlock_maxBlock_level。level表示的是合并的次数。每个形如partionKey_minBlock_maxBlock_level的目录下的所有文件构成一个DataPart。由于数据是一次性导入的因此可以看到合并的level只有一次，且每个datapart大小有个上限，因此两个属于同一个partion的datapart没有合并成一个。
+分区目录的格式为partionKey_minBlock_maxBlock_level。level表示的是合并的次数。每个形如partionKey_minBlock_maxBlock_level的目录下的所有文件构成一个DataPart。每个datapart大小有个上限，并不能一直合并。
 
 primary.idx：主键索引文件，用于存放稀疏索引的数据。通过查询条件与稀疏索引能够快速的过滤无用的数据，减少需要加载的数据量。
 
@@ -48,9 +53,10 @@ primary.idx：主键索引文件，用于存放稀疏索引的数据。通过查
 
 {column}.mrk2：列数据的标记信息，记录了数据块在 bin 文件中的偏移量。标记文件首先与列数据的存储文件对齐，记录了某个压缩块在 bin 文件中的相对位置；其次与索引文件对齐，记录了稀疏索引对应数据在列存储文件中的位置.(compact模式下只有一个data.mrk3文件)
 
+minmax_EventDate.idx: 分区键的minmax索引文件。
 columns.txt：列名以及数据类型
 
-count.txt：记录数据的总行数，
+count.txt：记录数据的总行数。
 **注意**:可能会有读者有疑惑，mark存在的意义在哪，为什么不可以直接通过primary.idx直接索引到.bin数据文件。笔者认为，为了加快数据的查询效率，ClickHouse中的primary索引是常驻内存的，因此需要尽量较少主键索引的大小，而如果没有mark文件，那么势必主键索引中需要记录目前mark文件中有关.bin文件的偏移信息，会造成内存压力。
 #### 主键索引
 具体的以官方文档为例。
@@ -85,9 +91,13 @@ INDEX index_name expr TYPE type(...) GRANULARITY granularity_value
 5. bloom_filter(bloom_filter([false_positive]) – 为指定的列存储布隆过滤器
 
 ### SELECT读数据
-SELECT读数据主要分为两部分
+SELECT读数据主要分为两三部分，如下图所示。
 1. 首先通过分区和一系列索引来排除不需要扫描的datapart和Mark(getAnalysisResult)
-2. 真正的调度线程去从文件中读取数据(spreadMarkRangesAmongStreams)。
+2. 将待扫描的DataPart划分为更细粒度的ThreadTask，并尽量将不同的磁盘负载分配到不同的线程中去以达到磁盘最大的并行化。(spreadMarkRangesAmongStreams)。
+3. PIPELINE执行时，真正的调度线程拉取markRage(getTask)并从文件中读取数据(readRows)
+
+![](https://lxhblog.oss-cn-beijing.aliyuncs.com/bigdata/select.png)
+
 
 ```
 void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, const BuildQueryPipelineSettings &)
@@ -109,7 +119,7 @@ void ReadFromMergeTree::initializePipeline(QueryPipelineBuilder & pipeline, cons
     }
 }
 ```
-一. 找到需要扫描的mark
+#### 分析需要扫描的mark
 上一篇文章《ClickHouse的QueryPlan到Pipeline的翻译》中讲述了ClickHouse是如何从queryPlan转化为pipeline，而读数据的第一部分就是在构建pipeline时候做的(IsourceStep.updatePipeline)，调用栈如下。
 
 ![](https://lxhblog.oss-cn-beijing.aliyuncs.com/bigdata/buildquery.png)
@@ -248,11 +258,11 @@ RangesInDataParts MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipInd
     return parts_with_ranges;
 }
 ```
-具体来看markRangesFromPKRange方法,(1)处方法定义了判断一个MarkRange里是否可能含有满足条件的数据，可能则返回真，否则返回false。(2)处代码，首先将整个datapart的mark放入栈中，然后来判断全部的markRange有没有可能含有目标列。如果没有则直接排除掉(3)。如果可能含有目标列，那么继续将markRange划分，range范围包括step个mark。依次次类推。示意图如下
+具体来看markRangesFromPKRange方法,(1)处方法定义了判断一个MarkRange里是否可能含有满足条件的数据，可能则返回真，否则返回false。(2)处代码，首先将整个datapart的mark放入栈中，然后来判断全部的markRange有没有可能含有目标列。如果没有则直接排除掉(3)。如果可能含有目标列，那么继续将markRange划分，range范围包括step个mark，并将这些新range放入栈中。依次类推。示意图如下
 
 ![](https://lxhblog.oss-cn-beijing.aliyuncs.com/bigdata/step.png)
 
-(4)处代码表示，最后筛选后的结果range都是一个mark，这个时候要判断，该目标mark与上一个符合要求的range之间的gap，如果gap小于参数min_marks_for_seek则，则将这个mark与上一个range合成一个range。
+(4)处代码表示，最后筛选后的结果range都是一个mark，这个时候要判断，该目标mark与上一个符合要求的range之间的gap，如果gap小于参数min_marks_for_seek则，则将这个mark与上一个range合成一个range。示意图如下。
 
 ![](https://lxhblog.oss-cn-beijing.aliyuncs.com/bigdata/gap.png)
 ```
@@ -334,181 +344,127 @@ MarkRanges MergeTreeDataSelectExecutor::markRangesFromPKRange(
     return res;
 }
 ```
-
+#### 划分ThreadTask
+spreadMarkRangesAmongStreams函数中主要通过构建多个MergeTreeThreadSelectProcessor并与同一个MergeTreeReadPool相关联。而MergeTreeReadPool的构造函数中会调用fillPerPartInfo和fillPerThreadInfo方法。fillPerPartInfo方法主要是统计了每个待读取的DataPart的相关信息，比如每个DataPart含有的总mark数。而fillPerThreadInfo方法中则是首先将所有的DataPart按照所在的disk名字进行排序，然后将这些的DataPart，进一步分成小的markranges。Mark作为ClickHouse中读取数据的最小单位，markrange记录了Datapart
+中mark的范围[begin,end).
 ```
-Pipe ReadFromMergeTree::spreadMarkRangesAmongStreams(
-    RangesInDataParts && parts_with_ranges,
-    const Names & column_names)
+void MergeTreeReadPool::fillPerThreadInfo(
+    size_t threads, size_t sum_marks, std::vector<size_t> per_part_sum_marks,
+    const RangesInDataParts & parts, size_t min_marks_for_concurrent_read)
 {
-    const auto & settings = context->getSettingsRef();
-    const auto data_settings = data.getSettings();
+    threads_tasks.resize(threads);      //thread_taks类似于一个二维数组，存放每个线程tasks
+    ...
 
-    PartRangesReadInfo info(parts_with_ranges, settings, *data_settings);
+    using PartsInfo = std::vector<PartInfo>;
+    std::queue<PartsInfo> parts_queue;
 
-    if (0 == info.sum_marks)
-        return {};
-
-    size_t num_streams = requested_num_streams;
-    if (num_streams > 1)
     {
-        /// Reduce the number of num_streams if the data is small.
-        if (info.sum_marks < num_streams * info.min_marks_for_concurrent_read && parts_with_ranges.size() < num_streams)
-            num_streams = std::max((info.sum_marks + info.min_marks_for_concurrent_read - 1) / info.min_marks_for_concurrent_read, parts_with_ranges.size());
-    }
+        // 根据DataPart所在Disk的名字排序
+        std::map<String, std::vector<PartInfo>> parts_per_disk;
 
-    return read(std::move(parts_with_ranges), column_names, ReadType::Default,
-                num_streams, info.min_marks_for_concurrent_read, info.use_uncompressed_cache);
-}
-
-Pipe ReadFromMergeTree::read(
-    RangesInDataParts parts_with_range, Names required_columns, ReadType read_type,
-    size_t max_streams, size_t min_marks_for_concurrent_read, bool use_uncompressed_cache)
-{
-    if (read_type == ReadType::Default && max_streams > 1)
-        return readFromPool(parts_with_range, required_columns, max_streams,
-                            min_marks_for_concurrent_read, use_uncompressed_cache);
-
-    auto pipe = readInOrder(parts_with_range, required_columns, read_type, use_uncompressed_cache, 0);
-
-    /// Use ConcatProcessor to concat sources together.
-    /// It is needed to read in parts order (and so in PK order) if single thread is used.
-    if (read_type == ReadType::Default && pipe.numOutputPorts() > 1)
-        pipe.addTransform(std::make_shared<ConcatProcessor>(pipe.getHeader(), pipe.numOutputPorts()));
-
-    return pipe;
-}
-
-
-Pipe ReadFromMergeTree::readFromPool(
-    RangesInDataParts parts_with_range,
-    Names required_columns,
-    size_t max_streams,
-    size_t min_marks_for_concurrent_read,
-    bool use_uncompressed_cache)
-{
-    Pipes pipes;
-    size_t sum_marks = 0;
-    size_t total_rows = 0;
-
-    for (const auto & part : parts_with_range)
-    {
-        sum_marks += part.getMarksCount();
-        total_rows += part.getRowsCount();
-    }
-
-    const auto & settings = context->getSettingsRef();
-    const auto & client_info = context->getClientInfo();
-    MergeTreeReadPool::BackoffSettings backoff_settings(settings);
-
-    auto pool = std::make_shared<MergeTreeReadPool>(
-        max_streams,
-        sum_marks,
-        min_marks_for_concurrent_read,
-        std::move(parts_with_range),
-        data,
-        storage_snapshot,
-        prewhere_info,
-        required_columns,
-        backoff_settings,
-        settings.preferred_block_size_bytes,
-        false);
-
-    auto * logger = &Poco::Logger::get(data.getLogName() + " (SelectExecutor)");
-    LOG_DEBUG(logger, "Reading approx. {} rows with {} streams", total_rows, max_streams);
-
-    for (size_t i = 0; i < max_streams; ++i)
-    {
-        std::optional<ParallelReadingExtension> extension;
-        if (read_task_callback)
+        for (size_t i = 0; i < parts.size(); ++i)
         {
-            extension = ParallelReadingExtension
-            {
-                .callback = read_task_callback.value(),
-                .count_participating_replicas = client_info.count_participating_replicas,
-                .number_of_current_replica = client_info.number_of_current_replica,
-                .colums_to_read = required_columns
-            };
+            PartInfo part_info{parts[i], per_part_sum_marks[i], i};
+            if (parts[i].data_part->isStoredOnDisk())
+                parts_per_disk[parts[i].data_part->volume->getDisk()->getName()].push_back(std::move(part_info));
+            else
+                parts_per_disk[""].push_back(std::move(part_info));
         }
 
-        auto source = std::make_shared<MergeTreeThreadSelectProcessor>(
-            i, pool, min_marks_for_concurrent_read, max_block_size,
-            settings.preferred_block_size_bytes, settings.preferred_max_column_in_block_size_bytes,
-            data, storage_snapshot, use_uncompressed_cache,
-            prewhere_info, actions_settings, reader_settings, virt_column_names, std::move(extension));
-
-        /// Set the approximate number of rows for the first source only
-        /// In case of parallel processing on replicas do not set approximate rows at all.
-        /// Because the value will be identical on every replicas and will be accounted
-        /// multiple times (settings.max_parallel_replicas times more)
-        if (i == 0 && !client_info.collaborate_with_initiator)
-            source->addTotalRowsApprox(total_rows);
-
-        pipes.emplace_back(std::move(source));
+        for (auto & info : parts_per_disk)
+            parts_queue.push(std::move(info.second));
     }
 
-    return Pipe::unitePipes(std::move(pipes));
+    const size_t min_marks_per_thread = (sum_marks - 1) / threads + 1;
+
+    // 遍历每一个线程，为每一个线程分配任务
+    for (size_t i = 0; i < threads && !parts_queue.empty(); ++i)
+    {
+        auto need_marks = min_marks_per_thread;
+
+        while (need_marks > 0 && !parts_queue.empty())
+        {
+            auto & current_parts = parts_queue.front();
+            RangesInDataPart & part = current_parts.back().part;
+            size_t & marks_in_part = current_parts.back().sum_marks;
+            const auto part_idx = current_parts.back().part_idx;
+
+            /// Do not get too few rows from part.
+            if (marks_in_part >= min_marks_for_concurrent_read &&
+                need_marks < min_marks_for_concurrent_read)
+                need_marks = min_marks_for_concurrent_read;
+
+            /// Do not leave too few rows in part for next time.
+            if (marks_in_part > need_marks &&
+                marks_in_part - need_marks < min_marks_for_concurrent_read)
+                need_marks = marks_in_part;
+
+            MarkRanges ranges_to_get_from_part;
+            size_t marks_in_ranges = need_marks;gett
+
+            /// Get whole part to read if it is small enough.
+            if (marks_in_part <= need_marks)
+            {
+                ranges_to_get_from_part = part.ranges;
+                marks_in_ranges = marks_in_part;
+
+                need_marks -= marks_in_part;
+                current_parts.pop_back();
+                if (current_parts.empty())
+                    parts_queue.pop();
+            }
+            else
+            {
+                /// Loop through part ranges.
+                while (need_marks > 0)
+                {
+                    if (part.ranges.empty())
+                        throw Exception("Unexpected end of ranges while spreading marks among threads", ErrorCodes::LOGICAL_ERROR);
+
+                    MarkRange & range = part.ranges.front();
+
+                    const size_t marks_in_range = range.end - range.begin;
+                    const size_t marks_to_get_from_range = std::min(marks_in_range, need_marks);
+
+                    ranges_to_get_from_part.emplace_back(range.begin, range.begin + marks_to_get_from_range);
+                    range.begin += marks_to_get_from_range;
+                    marks_in_part -= marks_to_get_from_range;
+                    need_marks -= marks_to_get_from_range;
+                    if (range.begin == range.end)
+                        part.ranges.pop_front();
+                }
+            }
+            //
+            threads_tasks[i].parts_and_ranges.push_back({ part_idx, ranges_to_get_from_part });
+            threads_tasks[i].sum_marks_in_parts.push_back(marks_in_ranges);
+            if (marks_in_ranges != 0)
+                remaining_thread_tasks.insert(i);
+        }
+
+        //切换到分配下一个线程任务之前，切换disk。这样尽可能的是不同的磁盘负载到不同的线程中去，依次来最大化磁盘并行度。
+        if (parts_queue.size() > 1)
+        {
+            parts_queue.push(std::move(parts_queue.front()));
+            parts_queue.pop();
+        }
+    }
 }
 ```
-二. 读取数据
-
-![](https://lxhblog.oss-cn-beijing.aliyuncs.com/bigdata/readRow.png)
+#### PIPELINE执行
+在pipeline执行的时候，MergeTreeThreadSelectProcessor的work方法会调用到getTask方法向MergeTreeReadPool中请求Task
 ```
-bool MergeTreeThreadSelectProcessor::getNewTaskImpl()
-{
-    task = pool->getTask(min_marks_to_read, thread, ordered_names);
-    return static_cast<bool>(task);
-}
-
 MergeTreeReadTaskPtr MergeTreeReadPool::getTask(size_t min_marks_to_read, size_t thread, const Names & ordered_names)
 {
-    const std::lock_guard lock{mutex};
-
-    /// If number of threads was lowered due to backoff, then will assign work only for maximum 'backoff_state.current_threads' threads.
-    if (thread >= backoff_state.current_threads)
-        return nullptr;
-
-    if (remaining_thread_tasks.empty())
-        return nullptr;
-
-    const auto tasks_remaining_for_this_thread = !threads_tasks[thread].sum_marks_in_parts.empty();
-    if (!tasks_remaining_for_this_thread && do_not_steal_tasks)
-        return nullptr;
-
-    /// Steal task if nothing to do and it's not prohibited
+    ...
     auto thread_idx = thread;
     if (!tasks_remaining_for_this_thread)
     {
-        auto it = remaining_thread_tasks.lower_bound(backoff_state.current_threads);
-        // Grab the entire tasks of a thread which is killed by backoff
-        if (it != remaining_thread_tasks.end())
-        {
-            threads_tasks[thread] = std::move(threads_tasks[*it]);
-            remaining_thread_tasks.erase(it);
-            remaining_thread_tasks.insert(thread);
-        }
-        else // Try steal tasks from the next thread
-        {
-            it = remaining_thread_tasks.upper_bound(thread);
-            if (it == remaining_thread_tasks.end())
-                it = remaining_thread_tasks.begin();
-            thread_idx = *it;
-        }
+      ... //如果本线程的task做完，则尝试窃取其他线程的任务                                                  
     }
-    auto & thread_tasks = threads_tasks[thread_idx];
 
-    auto & thread_task = thread_tasks.parts_and_ranges.back();
-    const auto part_idx = thread_task.part_idx;
-
-    auto & part = parts_with_idx[part_idx];
-    auto & marks_in_part = thread_tasks.sum_marks_in_parts.back();
-
-    size_t need_marks;
-    if (is_part_on_remote_disk[part_idx]) /// For better performance with remote disks
-        need_marks = marks_in_part;
-    else /// Get whole part to read if it is small enough.
-        need_marks = std::min(marks_in_part, min_marks_to_read);
-
+    ...
     /// Do not leave too little rows in part for next time.
+    // 如果此次获取到的range后，剩下的mark比较少，那么就一次行读整个DataPart，提高效率。
     if (marks_in_part > need_marks &&
         marks_in_part - need_marks < min_marks_to_read)
         need_marks = marks_in_part;
@@ -516,6 +472,7 @@ MergeTreeReadTaskPtr MergeTreeReadPool::getTask(size_t min_marks_to_read, size_t
     MarkRanges ranges_to_get_from_part;
 
     /// Get whole part to read if it is small enough.
+    //DataPart本身含有的mark总数就比较少，也一次性的读取整个DataPart
     if (marks_in_part <= need_marks)
     {
         const auto marks_to_get_from_range = marks_in_part;
@@ -530,8 +487,10 @@ MergeTreeReadTaskPtr MergeTreeReadPool::getTask(size_t min_marks_to_read, size_t
             remaining_thread_tasks.erase(thread_idx);
     }
     else
-    {
+    {   
+
         /// Loop through part ranges.
+        // 遍历这个DataPart的range，找到足够数量的mark然后返回。
         while (need_marks > 0 && !thread_task.ranges.empty())
         {
             auto & range = thread_task.ranges.front();
@@ -549,148 +508,42 @@ MergeTreeReadTaskPtr MergeTreeReadPool::getTask(size_t min_marks_to_read, size_t
         }
     }
 
-    auto curr_task_size_predictor = !per_part_size_predictor[part_idx] ? nullptr
-        : std::make_unique<MergeTreeBlockSizePredictor>(*per_part_size_predictor[part_idx]); /// make a copy
-
     return std::make_unique<MergeTreeReadTask>(
         part.data_part, ranges_to_get_from_part, part.part_index_in_query, ordered_names,
         per_part_column_name_set[part_idx], per_part_columns[part_idx], per_part_pre_columns[part_idx],
         prewhere_info && prewhere_info->remove_prewhere_column, per_part_should_reorder[part_idx], std::move(curr_task_size_predictor));
 }
 ```
-pre_where 读取
+MergeTreeThreadSelectProcessor的work在执行完getTask方法后，会根据返回的结果去读取数据。
+代码调用如下。
+
+![](https://lxhblog.oss-cn-beijing.aliyuncs.com/bigdata/readRow.png)
+
+因为clickHouse有谓词下推的优化，MergeTreeRangeReader::read读取的逻辑上是首先根据PreWhere信息(如果有的话)去读取prewhere列(1)处，然后读取其他需要的列(2)处，最后根据preWhere信息去除掉不满足要求的列(5)处。而其中真正读取数据时(1,2,4)处，会根据DataPart类型对应于MergeTreeReaderCompact、MergeTreeReaderWide以及mergeTreeReaderInMemory三种Reader来最终将数据读到内存。除了mergeTreeReaderInMemory，其他两个读取数据主要涉及编解码，比较底层，有兴趣的同学可以阅读源码MergeTreeReaderWide/Compact/InMemroy::readRows。
+
 ```
 MergeTreeRangeReader::ReadResult MergeTreeRangeReader::read(size_t max_rows, MarkRanges & ranges)
 {
-    if (max_rows == 0)
-        throw Exception("Expected at least 1 row to read, got 0.", ErrorCodes::LOGICAL_ERROR);
-
-    ReadResult read_result;
-
+    ...
     if (prev_reader)
     {
-        read_result = prev_reader->read(max_rows, ranges);
+        read_result = prev_reader->read(max_rows, ranges);                  //(1)
+        ...
+        Columns columns = continueReadingChain(read_result, num_read_rows); //(2)
+        ...
 
-        size_t num_read_rows;
-        Columns columns = continueReadingChain(read_result, num_read_rows);
-
-        /// Nothing to do. Return empty result.
-        if (read_result.num_rows == 0)
-            return read_result;
-
-        bool has_columns = false;
-        size_t total_bytes = 0;
-        for (auto & column : columns)
-        {
-            if (column)
-            {
-                total_bytes += column->byteSize();
-                has_columns = true;
-            }
-        }
-
-        read_result.addNumBytesRead(total_bytes);
-
-        bool should_evaluate_missing_defaults = false;
-
-        if (has_columns)
-        {
-            /// num_read_rows >= read_result.num_rows
-            /// We must filter block before adding columns to read_result.block
-
-            /// Fill missing columns before filtering because some arrays from Nested may have empty data.
-            merge_tree_reader->fillMissingColumns(columns, should_evaluate_missing_defaults, num_read_rows);
-
-            if (read_result.getFilter())
-                filterColumns(columns, read_result.getFilter()->getData());
-        }
-        else
-        {
-            size_t num_rows = read_result.num_rows;
-
-            /// If block is empty, we still may need to add missing columns.
-            /// In that case use number of rows in result block and don't filter block.
-            if (num_rows)
-                merge_tree_reader->fillMissingColumns(columns, should_evaluate_missing_defaults, num_rows);
-        }
-
-        if (!columns.empty())
-        {
-            /// If some columns absent in part, then evaluate default values
-            if (should_evaluate_missing_defaults)
-            {
-                auto block = prev_reader->sample_block.cloneWithColumns(read_result.columns);
-                auto block_before_prewhere = read_result.block_before_prewhere;
-                for (const auto & column : block)
-                {
-                    if (block_before_prewhere.has(column.name))
-                        block_before_prewhere.erase(column.name);
-                }
-
-                if (block_before_prewhere)
-                {
-                    if (read_result.need_filter)
-                    {
-                        auto old_columns = block_before_prewhere.getColumns();
-                        filterColumns(old_columns, read_result.getFilterOriginal()->getData());
-                        block_before_prewhere.setColumns(old_columns);
-                    }
-
-                    for (auto & column : block_before_prewhere)
-                        block.insert(std::move(column));
-                }
-                merge_tree_reader->evaluateMissingDefaults(block, columns);
-            }
-            /// If columns not empty, then apply on-fly alter conversions if any required
-            merge_tree_reader->performRequiredConversions(columns);
-        }
-
-        read_result.columns.reserve(read_result.columns.size() + columns.size());
-        for (auto & column : columns)
+        for (auto & column : columns)                                       //(3)
             read_result.columns.emplace_back(std::move(column));
     }
     else
     {
-        read_result = startReadingChain(max_rows, ranges);
-        read_result.num_rows = read_result.numReadRows();
-
-        if (read_result.num_rows)
-        {
-            bool should_evaluate_missing_defaults;
-            merge_tree_reader->fillMissingColumns(read_result.columns, should_evaluate_missing_defaults,
-                                                  read_result.num_rows);
-
-            /// If some columns absent in part, then evaluate default values
-            if (should_evaluate_missing_defaults)
-                merge_tree_reader->evaluateMissingDefaults({}, read_result.columns);
-
-            /// If result not empty, then apply on-fly alter conversions if any required
-            merge_tree_reader->performRequiredConversions(read_result.columns);
-        }
-        else
-            read_result.columns.clear();
-
-        size_t total_bytes = 0;
-        for (auto & column : read_result.columns)
-            total_bytes += column->byteSize();
-
-        read_result.addNumBytesRead(total_bytes);
+        ...
+        read_result = startReadingChain(max_rows, ranges);                  //(4)
+        ...
     }
 
-    if (read_result.num_rows == 0)
-        return read_result;
-
-    executePrewhereActionsAndFilterColumns(read_result);
-
+    ...
+    executePrewhereActionsAndFilterColumns(read_result);                    //(5)
     return read_result;
 }
 ```
-readrows读取,
-因为数据格式的不同，有MergeTreeReaderCompact和MergeTreeReaderWide以及mergeTreeReaderInMemory.
-```
-
-```
-### 多版本
-#### 参考文献
-1. https://xie.infoq.cn/article/9f325fb7ddc5d12362f4c88a8
-2. https://clickhouse.com/docs/en/engines/table-engines/mergetree-family/mergetree#mergetree-data-storage
