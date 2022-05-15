@@ -125,6 +125,27 @@ private:
 
     ThreadPool pool;                                      //线程池
 };
+
+
+template <class Queue>
+void MergeTreeBackgroundExecutor<Queue>::threadFunction()
+{
+    ...
+
+    while (true)
+    {
+        try
+        {
+
+            ...
+            routine(std::move(item));  //routine函数中会调用task->executeStep
+        }
+        catch (...)
+        {
+            tryLogCurrentException(__PRETTY_FUNCTION__);
+        }
+    }
+}
 ```
 #### 调用关系
 上面讲到在方法finishDelayedChunk的最后通过调用storage.background_operations_assignee.trigger()触发merge。trigger方法中通过
@@ -279,7 +300,7 @@ merger_mutator.selectPartsToMerge为方法，逻辑主要为遍历目前的所�
 2. 使用事务时候，DataPart是同时可见的
 3. 待更正的mutation版本是一致的。
 
-因为每次可以Merge的DataPart数量是有限制的，因此还需要在所有可以合并的DataPart中选择最合适的Range来合并。实现在如下方法中，是一种启发时算法，有兴趣的同学可以研究一下。
+因为每次可以Merge的DataPart数量是有限制的，因此还需要在所有可以合并的DataPart中选择最合适的Range来合并。实现在如下方法中，是一种启发式算法，有兴趣的同学可以研究一下。
 ```
 PartsRange select(
         const PartsRanges & parts_ranges,
@@ -294,3 +315,221 @@ MergeTreeDataMergerMutator::selectPartsToMerge
 这里大约概括下选择parts的策略，里面还有很多细节。感兴趣的同学可以去研读代码
 
 #### merge的执行
+上面说到，在选完待merge的parts后，那么如何把这些part，merge起来呢。构建了一个MergePlainMergeTreeTask，然后通过assignee.scheduleMergeMutateTask方法最终将task加入到MergeTreeBackgroundExecutor的pending队列里。由上述讲过的ergeTreeBackgroundExecutor的执行逻辑，最终会执行MergePlainMergeTreeTask的executeStep，executeStep函数返回true说明还需要再次执行，那么这个任务执行完executeStep后还会放回到penging队列里。
+```
+bool MergePlainMergeTreeTask::executeStep()
+{
+    ...
+    switch (state)
+    {
+        case State::NEED_PREPARE :
+        {
+            prepare();
+            state = State::NEED_EXECUTE;
+            return true;
+        }
+        case State::NEED_EXECUTE :
+        {
+            try
+            {
+                if (merge_task->execute())
+                    return true;
+
+                state = State::NEED_FINISH;
+                return true;
+            }
+            catch (...)
+            {
+                write_part_log(ExecutionStatus::fromCurrentException());
+                throw;
+            }
+        }
+        ...
+    return false;
+}
+
+
+void MergePlainMergeTreeTask::prepare()
+{
+    future_part = merge_mutate_entry->future_part;
+    stopwatch_ptr = std::make_unique<Stopwatch>();
+
+    const Settings & settings = storage.getContext()->getSettingsRef();
+    merge_list_entry = storage.getContext()->getMergeList().insert(
+        storage.getStorageID(),
+        future_part,
+        settings);
+
+  ...
+
+    merge_task = storage.merger_mutator.mergePartsToTemporaryPart(
+            future_part,
+            metadata_snapshot,
+            merge_list_entry.get(),
+            {} /* projection_merge_list_element */,
+            table_lock_holder,
+            time(nullptr),
+            storage.getContext(),
+            merge_mutate_entry->tagger->reserved_space,
+            deduplicate,
+            deduplicate_by_columns,
+            storage.merging_params,
+            txn);
+}
+
+```
+根据状态会首先执行prepare，prepare中调用的mergePartsToTemporaryPart方什么都没做，只是构造了一个MergeTask对象并返回。等到下次在执行这个task的时候，根据状态会继续执行mergeTask->execute方法,也就是会首先执行prepare方法然后执行executeImpl方法
+```
+using ExecuteAndFinalizeHorizontalPartSubtasks = std::array<std::function<bool()>, 2>;
+
+        ExecuteAndFinalizeHorizontalPartSubtasks subtasks
+        {
+            [this] () { return prepare(); },
+            [this] () { return executeImpl(); }
+        };
+
+        ExecuteAndFinalizeHorizontalPartSubtasks::iterator subtasks_iterator = subtasks.begin();
+
+bool MergeTask::ExecuteAndFinalizeHorizontalPart::execute()
+{
+    assert(subtasks_iterator != subtasks.end());
+    if ((*subtasks_iterator)())
+        return true;
+
+    /// Move to the next subtask in an array of subtasks
+    ++subtasks_iterator;
+    return subtasks_iterator != subtasks.end();
+}
+```
+prepare方法中做了许多检查和准备工作然后写入context中，比如检查新part名字是否重合，磁盘空间是否满足，以及各个DataPar方式等等，最重要的两个方法是chooseMergeAlgorithm以及createMergedStream
+```
+bool MergeTask::ExecuteAndFinalizeHorizontalPart::prepare()
+{
+    ...
+
+    global_ctx->chosen_merge_algorithm = chooseMergeAlgorithm();
+
+
+    switch (global_ctx->chosen_merge_algorithm)
+    {
+        case MergeAlgorithm::Horizontal :
+        {
+            global_ctx->merging_columns = global_ctx->storage_columns;
+            global_ctx->merging_column_names = global_ctx->all_column_names;
+            global_ctx->gathering_columns.clear();
+            global_ctx->gathering_column_names.clear();
+            break;
+        }
+        case MergeAlgorithm::Vertical :
+        {
+            ctx->rows_sources_file = createTemporaryFile(ctx->tmp_disk->getPath());
+            ctx->rows_sources_uncompressed_write_buf = ctx->tmp_disk->writeFile(fileName(ctx->rows_sources_file->path()), DBMS_DEFAULT_BUFFER_SIZE, WriteMode::Rewrite, global_ctx->context->getWriteSettings());
+            ctx->rows_sources_write_buf = std::make_unique<CompressedWriteBuffer>(*ctx->rows_sources_uncompressed_write_buf);
+
+            MergeTreeDataPartInMemory::ColumnToSize local_merged_column_to_size;
+            for (const MergeTreeData::DataPartPtr & part : global_ctx->future_part->parts)
+                part->accumulateColumnSizes(local_merged_column_to_size);
+
+            ctx->column_sizes = ColumnSizeEstimator(
+                std::move(local_merged_column_to_size),
+                global_ctx->merging_column_names,
+                global_ctx->gathering_column_names);
+
+            break;
+        }
+        default :
+            throw Exception("Merge algorithm must be chosen", ErrorCodes::LOGICAL_ERROR);
+    }
+
+
+    createMergedStream();
+
+    global_ctx->to = std::make_shared<MergedBlockOutputStream>(
+        global_ctx->new_data_part,
+        global_ctx->metadata_snapshot,
+        global_ctx->merging_columns,
+        MergeTreeIndexFactory::instance().getMany(global_ctx->metadata_snapshot->getSecondaryIndices()),
+        ctx->compression_codec,
+        global_ctx->txn,
+        /*reset_columns=*/ true,
+        ctx->blocks_are_granules_size,
+        global_ctx->context->getWriteSettings());
+
+    ...
+
+    /// This is the end of preparation. Execution will be per block.
+    return false;
+}
+```
+createMergedStream其实就是构建一个QueryPipeline，有多少个DataPart就有多少个ISource，然后添加一个mergeTransform。看到PullingPipelineExecutor有没有很熟悉，在本系列的文章<<ClickHouse中Pipeline的执行>>中说过，PullingPipelineExecutor是执行pipeline的起点。
+```
+void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream()
+{
+    /** Read from all parts, merge and write into a new one.
+      * In passing, we calculate expression for sorting.
+      */
+    Pipes pipes;
+
+    ...
+    for (const auto & part : global_ctx->future_part->parts)
+    {
+        auto input = std::make_unique<MergeTreeSequentialSource>(
+            *global_ctx->data, global_ctx->storage_snapshot, part, global_ctx->merging_column_names, ctx->read_with_direct_io, true);
+
+        ...
+
+        if (global_ctx->metadata_snapshot->hasSortingKey())
+        {
+            pipe.addSimpleTransform([this](const Block & header)
+            {
+                return std::make_shared<ExpressionTransform>(header, global_ctx->metadata_snapshot->getSortingKey().expression);
+            });
+        }
+
+        pipes.emplace_back(std::move(pipe));
+    }
+
+    ...
+    switch (ctx->merging_params.mode)
+    {
+        case MergeTreeData::MergingParams::Ordinary:
+            merged_transform = std::make_shared<MergingSortedTransform>(
+                header, pipes.size(), sort_description, merge_block_size, 0, ctx->rows_sources_write_buf.get(), true, ctx->blocks_are_granules_size);
+            break;
+
+        case MergeTreeData::MergingParams::Collapsing:
+            merged_transform = std::make_shared<CollapsingSortedTransform>(
+                header, pipes.size(), sort_description, ctx->merging_params.sign_column, false,
+                merge_block_size, ctx->rows_sources_write_buf.get(), ctx->blocks_are_granules_size);
+            break;
+
+        case MergeTreeData::MergingParams::Summing:
+            merged_transform = std::make_shared<SummingSortedTransform>(
+                header, pipes.size(), sort_description, ctx->merging_params.columns_to_sum, partition_key_columns, merge_block_size);
+            break;
+
+        ...
+    }
+
+    auto res_pipe = Pipe::unitePipes(std::move(pipes));
+    res_pipe.addTransform(std::move(merged_transform));
+
+    ...
+
+    global_ctx->merged_pipeline = QueryPipeline(std::move(res_pipe));
+    global_ctx->merging_executor = std::make_unique<PullingPipelineExecutor>(global_ctx->merged_pipeline);                                    //
+}
+```
+那么executeImpl函数就很简单了就是执行QueryPipeline(1)处,之前讲过PullingPipelineExecutor->pull是pipeline执行的起点。
+```
+bool MergeTask::ExecuteAndFinalizeHorizontalPart::executeImpl()
+{
+    Block block;
+    if (!ctx->is_cancelled() && (global_ctx->merging_executor->pull(block)))  //(1)
+    {
+        ...
+
+    return false;
+}
+```
+#### 总结
