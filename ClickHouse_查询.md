@@ -189,7 +189,7 @@ void MergeTreeDataSelectExecutor::selectPartsToRead(
 
 MergeTreeDataSelectExecutor::filterPartsByPrimaryKeyAndSkipIndexes()
 
-filterPartsByPrimaryKeyAndSkipIndexes方法整体上并不复杂，大部门代码是方法process_part的函数体(1)处。然后在(4)处创新一个新的线程池，并在(5)处向线程池中提交任务，也就是说会有num_threads个线程会执行process_part方法。
+filterPartsByPrimaryKeyAndSkipIndexes方法整体上并不复杂，大部分代码是方法process_part的函数体(1)处。然后在(4)处创新一个新的线程池，并在(5)处向线程池中提交任务，也就是说会有num_threads个线程会执行process_part方法。
 
 具体来看process_part方法。(2)处markRangesFromPKRange方法是通过主键筛选，(3)处的
 useful_indices是跳数索引。
