@@ -477,7 +477,7 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream()
             *global_ctx->data, global_ctx->storage_snapshot, part, global_ctx->merging_column_names, ctx->read_with_direct_io, true);
 
         ...
-
+        //
         if (global_ctx->metadata_snapshot->hasSortingKey())
         {
             pipe.addSimpleTransform([this](const Block & header)
@@ -490,6 +490,7 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream()
     }
 
     ...
+    //根据存储引擎的不同，选择不同的mergeTransform
     switch (ctx->merging_params.mode)
     {
         case MergeTreeData::MergingParams::Ordinary:
@@ -520,7 +521,7 @@ void MergeTask::ExecuteAndFinalizeHorizontalPart::createMergedStream()
     global_ctx->merging_executor = std::make_unique<PullingPipelineExecutor>(global_ctx->merged_pipeline);                                    //
 }
 ```
-那么executeImpl函数就很简单了就是执行QueryPipeline(1)处,之前讲过PullingPipelineExecutor->pull是pipeline执行的起点。
+那么executeImpl函数就很简单了就是执行QueryPipeline(1)处,之前文章讲过PullingPipelineExecutor->pull是pipeline执行的起点。
 ```
 bool MergeTask::ExecuteAndFinalizeHorizontalPart::executeImpl()
 {
@@ -533,3 +534,6 @@ bool MergeTask::ExecuteAndFinalizeHorizontalPart::executeImpl()
 }
 ```
 #### 总结
+整体过程概括来说，执行写入Pipeline时，最终执行的核心方法是在MergeTreeSink类consume方法中，首先将写入的数据按分区分成多个Block，然后针对每个Block形成一个DataPart并写入临时文件，然后刷盘到disk，最后通过改名字使得临时DataPart生效。然后触发后台merge。merge的过程其实大体分为两部分，首先是选择能够merge的Datapart，其次是真正的构建流水线来将不同的DataPart合起来。
+
+**注**：整个过程省略了很多细节，只是讲解了大体上的执行过程和逻辑，如果全部展开的话，内容实在是太多了。比方其中涉及到的DataPart事务transaction，选择DataPart的启发式算法以及MergeTransorm的执行。后续会写些文章慢慢补充完善。
