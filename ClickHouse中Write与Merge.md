@@ -1,3 +1,12 @@
+---
+title: ClickHouse中write与merge
+date: 2022-06-03 10:29:40
+tags: [ClickHouse]
+categories:
+     - [大数据]
+comments: true
+---
+
 ## ClickHouse中write与merge
 ### write过程
 写过程中对应的Processor是MergeTreeSink。
